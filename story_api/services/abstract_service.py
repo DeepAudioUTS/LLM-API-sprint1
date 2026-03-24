@@ -160,9 +160,6 @@ class AbstractService:
         if not abstract_text:
             raise HTTPException(status_code=502, detail="Model returned empty content")
 
-        if not payload.include_story_prompt:
-            return AbstractOnlyItem(abstract=[abstract_text])
-
         if not story_prompt_text:
             story_prompt_text = self._generate_story_prompt_from_abstract(
                 abstract_text, payload.theme
