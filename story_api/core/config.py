@@ -16,7 +16,6 @@ def read_hf_token() -> Optional[str]:
         or os.getenv("HugginFaceToken")
         or os.getenv("HuggingFaceToken")
     )
-    print(token)
     if not token:
         return None
     return token.strip().strip('"').strip("'")
