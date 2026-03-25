@@ -7,8 +7,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
-from story_api.core.config import DEFAULT_MODEL, HF_ROUTER_BASE_URL, read_hf_token
-from story_api.schemas.story import (
+from core.config import DEFAULT_MODEL, HF_ROUTER_BASE_URL, read_hf_token
+from schemas.story import (
     ModelQualityReview,
     StoryGenerateWithQualityRequest,
     StoryGenerateWithQualityResponse,
@@ -90,22 +90,22 @@ class StoryService:
         return self._extract_message_text(result.content)
 
     def generate_story(self, payload: StoryRequest) -> StoryResponse:
-        plain_text_guardrail = (
+        json_guardrail = (
             "\n\nOUTPUT FORMAT REQUIREMENTS (STRICT):\n"
-            "- Return plain text only.\n"
-            "- Do not return HTML, XML, or tags.\n"
-            "- Do not return Markdown, code fences, or backticks.\n"
-            "- Return only final story text.\n"
+            "- Return valid JSON only.\n"
+            '- Use exactly these keys: "title", "story".\n'
+            "- Do not return Markdown, code fences, or any extra keys.\n"
         )
 
         generation_template = PromptTemplate.from_template(
             "You are a professional children's storyteller.\n\n"
-            "Write a fun and educational story in plain text.\n"
+            "Write a fun and educational story for children ages 8-12.\n"
             "Education topic: {education_topic}\n\n"
             "Abstract source material:\n"
             "{abstract}\n\n"
             "Instructions for using the abstract:\n"
-            "{story_prompt}\n"
+            "{story_prompt}\n\n"
+            "Also generate a short, catchy title suitable for children.\n"
         )
         generation_prompt = generation_template.format(
             education_topic=payload.education_topic,
@@ -113,17 +113,35 @@ class StoryService:
             story_prompt=payload.story_prompt,
         )
 
-        story_text = self._invoke_chat(
+        raw_output = self._invoke_chat(
             model=DEFAULT_MODEL,
-            messages=[HumanMessage(content=generation_prompt + plain_text_guardrail)],
+            messages=[HumanMessage(content=generation_prompt + json_guardrail)],
             temperature=payload.temperature,
             max_tokens=payload.max_tokens,
         )
-        if not story_text.strip():
+        if not raw_output.strip():
             raise HTTPException(status_code=502, detail="Model returned empty content")
 
-        # TODO: add title
-        return StoryResponse(model=DEFAULT_MODEL, story=story_text, title="title")
+        parsed = self._extract_json_dict(raw_output) or {}
+        title = str(parsed.get("title") or "").strip()
+        story_text = str(parsed.get("story") or "").strip()
+
+        # Fallback when model does not follow JSON format perfectly.
+        if not story_text:
+            story_text = raw_output.strip()
+        normalized_title = title.strip().lower()
+        if not title or normalized_title in {"title", "story title", "untitled"}:
+            first_line = story_text.splitlines()[0].strip() if story_text.strip() else ""
+            # If the model put the title on the first line, use it.
+            if first_line and len(first_line) <= 80:
+                title = first_line
+                remaining = "\n".join(story_text.splitlines()[1:]).strip()
+                if remaining:
+                    story_text = remaining
+            else:
+                title = "A Curious Storya"
+
+        return StoryResponse(story=story_text, title=title)
 
     @staticmethod
     def _extract_json_dict(text: str) -> dict[str, Any] | None:
@@ -156,7 +174,6 @@ class StoryService:
 
         return None
 
-    @staticmethod
     def _coerce_int(value: Any) -> int | None:
         if value is None:
             return None
@@ -408,3 +425,4 @@ class StoryService:
             story_result=final_story,
             quality_result=final_quality,
         )
+
