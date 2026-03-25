@@ -7,8 +7,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
-from core.config import DEFAULT_MODEL, HF_ROUTER_BASE_URL, read_hf_token
-from schemas.story import (
+from story_api.core.config import DEFAULT_MODEL, HF_ROUTER_BASE_URL, read_hf_token
+from story_api.schemas.story import (
     ModelQualityReview,
     StoryGenerateWithQualityRequest,
     StoryGenerateWithQualityResponse,
