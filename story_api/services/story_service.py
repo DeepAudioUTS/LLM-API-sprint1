@@ -261,7 +261,7 @@ class StoryService:
         review_template = PromptTemplate.from_template(
             "Evaluate story quality for ages 8-12 with strict scoring.\n"
             "Story category: {story_category}\n"
-            "Debate round: {round_number}\n\n"
+            "Debate round: {round_number}\n"
             "Other reviewers' current positions:\n"
             "{others_context}\n\n"
             "Rubric weights: narrative_flow(20), educational_integration(20), scientific_accuracy(20), tone_vocabulary(15), read_aloud(10), character_agency(15).\n"
