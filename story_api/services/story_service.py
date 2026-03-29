@@ -90,22 +90,32 @@ class StoryService:
         return self._extract_message_text(result.content)
 
     def generate_story(self, payload: StoryRequest) -> StoryResponse:
-        json_guardrail = (
-            "\n\nOUTPUT FORMAT REQUIREMENTS (STRICT):\n"
-            "- Return valid JSON only.\n"
-            '- Use exactly these keys: "title", "story".\n'
-            "- Do not return Markdown, code fences, or any extra keys.\n"
-        )
-
         generation_template = PromptTemplate.from_template(
-            "You are a professional children's storyteller.\n\n"
-            "Write a fun and educational story for children ages 8-12.\n"
-            "Education topic: {education_topic}\n\n"
-            "Abstract source material:\n"
-            "{abstract}\n\n"
-            "Instructions for using the abstract:\n"
-            "{story_prompt}\n\n"
-            "Also generate a short, catchy title suitable for children.\n"
+            "# ROLE\n"
+            "You are a professional children's storyteller writing for an animated YouTube channel. Your task is to write a funny, educational story about {education_topic}, inspired by the energetic and curiosity-driven style of Korean educational comics like \"Why?\".\n\n"
+            "# CRITICAL FORMATTING CONSTRAINTS\n"
+            "- Output ONLY plain text story narration.\n"
+            "- DO NOT include ANY HTML or XML tags (for example: <p>, <div>, <br>, <!DOCTYPE html>, <html>, <body>).\n"
+            "- DO NOT include Markdown formatting (for example: headings, bullet lists, code blocks, or backticks).\n"
+            "- The response must be raw text only, as if it were read aloud directly.\n"
+            "- DO NOT include: Stage directions, panel descriptions, animation cues, formatting instructions, brackets, production notes, or character names with colons (e.g., \"Narrator:\").\n"
+            "- Target Length: 800-950 words (approximately 5 minutes when read aloud).\n"
+            "- Pacing: Use a natural spoken storytelling rhythm with lively, dynamic sentences. Avoid overly long paragraphs.\n\n"
+            "# TARGET AUDIENCE & TONE\n"
+            "- Audience: Children aged 8-12 years old who are curious, easily distracted, love dramatic reactions, and constantly ask \"Why?\".\n"
+            "- Tone: Funny, playfully dramatic, curious, warm, and fast-paced.\n"
+            "- Style Rules:\n"
+            "  - Make it feel like an exciting discovery.\n"
+            "  - Include exaggerated reactions and funny misunderstandings.\n"
+            "  - Naturally integrate science explanations into the dialogue and events.\n"
+            "  - Include at least three (3) exaggerated \"WHY?!\" moments.\n"
+            "  - Keep humor playful and silly (strictly no sarcasm or dark humor).\n\n"
+            "# EDUCATIONAL CONTENT REQUIREMENTS\n"
+            "You must clearly and accurately explain:\n"
+            "Abstract source material:\n{abstract}\n\n"
+            "Instructions for using the abstract:\n{story_prompt}\n\n"
+            "*Explanation Guidelines:* Use simple, highly visual comparisons. Avoid complex physics jargon, textbook-style lectures, and horror tones.\n\n"
+            "Now, generate the full 5-minute storytelling script following all instructions above."
         )
         generation_prompt = generation_template.format(
             education_topic=payload.education_topic,
@@ -113,35 +123,61 @@ class StoryService:
             story_prompt=payload.story_prompt,
         )
 
-        raw_output = self._invoke_chat(
+        llm = ChatOpenAI(
             model=DEFAULT_MODEL,
-            messages=[HumanMessage(content=generation_prompt + json_guardrail)],
+            base_url=HF_ROUTER_BASE_URL,
+            api_key=self._get_hf_token(),
             temperature=payload.temperature,
             max_tokens=payload.max_tokens,
+            request_timeout=180,
         )
-        if not raw_output.strip():
+
+        story_text = ""
+        for attempt in range(3):
+            try:
+                result = llm.invoke([
+                    SystemMessage(content="You are an expert children's educational fiction writer."),
+                    HumanMessage(content=generation_prompt)
+                ])
+                story_text = self._extract_message_text(result.content).strip()
+                if story_text:
+                    break
+            except Exception as err:
+                if attempt == 2:
+                    raise HTTPException(status_code=502, detail=f"LLM request fail: {err}") from err
+
+        if not story_text:
             raise HTTPException(status_code=502, detail="Model returned empty content")
 
-        parsed = self._extract_json_dict(raw_output) or {}
-        title = str(parsed.get("title") or "").strip()
-        story_text = str(parsed.get("story") or "").strip()
+        title_template = PromptTemplate.from_template(
+            "Based on the following story about {education_topic}, write a short, catchy, and fun title suitable for children.\n\n"
+            "Story:\n{story}\n\n"
+            "Return ONLY the title text without any quotes or additional formatting."
+        )
+        title_prompt = title_template.format(
+            education_topic=payload.education_topic,
+            story=story_text
+        )
 
-        # Fallback when model does not follow JSON format perfectly.
-        if not story_text:
-            story_text = raw_output.strip()
-        normalized_title = title.strip().lower()
-        if not title or normalized_title in {"title", "story title", "untitled"}:
-            first_line = story_text.splitlines()[0].strip() if story_text.strip() else ""
-            # If the model put the title on the first line, use it.
-            if first_line and len(first_line) <= 80:
-                title = first_line
-                remaining = "\n".join(story_text.splitlines()[1:]).strip()
-                if remaining:
-                    story_text = remaining
-            else:
-                title = "A Curious Storya"
+        title_text = ""
+        for attempt in range(3):
+            try:
+                result = llm.invoke([
+                    SystemMessage(content="You are an expert children's educational fiction writer."),
+                    HumanMessage(content=title_prompt)
+                ])
+                title_text = self._extract_message_text(result.content).strip()
+                if title_text:
+                    break
+            except Exception:
+                pass
 
-        return StoryResponse(story=story_text, title=title)
+        if not title_text:
+            title_text = "My Curious Story"
+        else:
+            title_text = title_text.strip('"').strip("'").strip()
+
+        return StoryResponse(story=story_text, title=title_text)
 
     @staticmethod
     def _extract_json_dict(text: str) -> dict[str, Any] | None:
@@ -155,7 +191,7 @@ class StoryService:
 
         for candidate in [cleaned]:
             try:
-                parsed = json.loads(candidate)
+                parsed = json.loads(candidate, strict=False)
                 if isinstance(parsed, dict):
                     return parsed
             except json.JSONDecodeError:
@@ -166,7 +202,7 @@ class StoryService:
         if start != -1 and end != -1 and end > start:
             candidate = cleaned[start : end + 1]
             try:
-                parsed = json.loads(candidate)
+                parsed = json.loads(candidate, strict=False)
                 if isinstance(parsed, dict):
                     return parsed
             except json.JSONDecodeError:
