@@ -3,31 +3,13 @@ import re
 from typing import Any
 
 from fastapi import HTTPException
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from story_api.core.config import DEFAULT_MODEL, HF_ROUTER_BASE_URL, read_hf_token
 from story_api.schemas.abstract import AbstractGenerateRequest, AbstractItem, AbstractOnlyItem
 
 
-def _extract_json_dict(text: str) -> dict[str, Any] | None:
-    """Extract a JSON object from LLM output, handling code fences and extra text."""
-    if not text:
-        return None
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(cleaned[start : end + 1])
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    return None
 
 
 class AbstractService:
@@ -46,31 +28,6 @@ class AbstractService:
         self._hf_token = token
         return token
 
-    def _generate_story_prompt_from_abstract(self, abstract: str, theme: str) -> str:
-        """Fallback: generate story_prompt when the main call did not return it."""
-        prompt = (
-            f"Given this story abstract and theme, write a brief instruction (1–3 sentences) "
-            f"for transforming the abstract into a full 5-minute children's story (ages 8–12). "
-            f"Include tone (e.g. playful, funny), structure, and how to weave in the educational content.\n\n"
-            f"Theme: {theme}\n\nAbstract:\n{abstract}\n\n"
-            "Return only the story prompt text, nothing else. No JSON, no labels."
-        )
-        try:
-            llm = ChatOpenAI(
-                model=DEFAULT_MODEL,
-                base_url=HF_ROUTER_BASE_URL,
-                api_key=self._get_hf_token(),
-                temperature=0.7,
-                max_tokens=200,
-                request_timeout=60,
-            )
-            result = llm.invoke([HumanMessage(content=prompt)])
-            return self._extract_message_text(result.content).strip()
-        except Exception as err:
-            raise HTTPException(
-                status_code=502, detail=f"Failed to generate story prompt: {err}"
-            ) from err
-
     @staticmethod
     def _extract_message_text(content: Any) -> str:
         if isinstance(content, str):
@@ -87,83 +44,94 @@ class AbstractService:
             return "\n".join(parts)
         return str(content or "")
 
-    @staticmethod
-    def _extract_abstract_text(raw: str, parsed: dict[str, Any] | None) -> str:
-        """Extract clean abstract text even when the model returns malformed JSON-like output."""
-        if parsed:
-            candidate = str(parsed.get("abstract") or "").strip()
-            if candidate:
-                return candidate
+    def _generate_story_prompt_from_abstract(self, abstract: str, theme: str) -> str:
 
-        cleaned = (raw or "").strip()
-        if not cleaned:
-            return ""
+        prompt = f"""Given this story abstract and theme, write an actionable, precise instruction block (3–5 sentences) that will be fed to a secondary AI writer to generate the full script. This prompt must dictate:
+            - Tone & Vibe: Specify the exact emotional feel (e.g., fast-paced and goofy, scientifically curious but spooky, warm and adventurous).
+            - Stylistic Rules: Mandate specific writing techniques (e.g., "Use exaggerated reactions," "Include fast-paced dialogue," "Focus on sensory details of the environment").
+            - Educational Delivery: Give the writer strict instructions on how to weave the facts in naturally (e.g., "Explain the science through the character's trial-and-error mistakes," "Do not use textbook definitions; use visual metaphors").
 
-        # Handle cases where the model returns text like: {"abstract":"...", "story_prompt":"..."
-        abstract_match = re.search(r'"abstract"\s*:\s*"(?P<value>.*?)"(?:\s*,\s*"story_prompt"|\s*})', cleaned, re.DOTALL)
-        if abstract_match:
-            candidate = abstract_match.group("value")
-            candidate = candidate.replace('\\n', ' ').replace('\\"', '"').strip()
-            if candidate:
-                return candidate
+            Theme: {theme}
 
-        return cleaned
+            Abstract:
+            {abstract}
 
+            Write the instructions directly without any conversational filler."""
+            
+        llm = ChatOpenAI(
+            model=DEFAULT_MODEL,
+            base_url=HF_ROUTER_BASE_URL,
+            api_key=self._get_hf_token(),
+            temperature=0.7,
+            max_tokens=500,
+            request_timeout=60,
+        )
+        for attempt in range(3):
+            try:
+                messages = [
+                    SystemMessage(content="You are an expert AI prompt engineer and story architect."),
+                    HumanMessage(content=prompt)
+                ]
+                result = llm.invoke(messages)
+                text = self._extract_message_text(result.content).strip()
+                if text:
+                    return text
+            except Exception as err:
+                if attempt == 2:
+                    raise HTTPException(status_code=502, detail=f"Failed to generate story prompt: {err}") from err
+        
+        raise HTTPException(status_code=502, detail="Failed to generate story prompt: Model returned empty content after 3 attempts.")
+    
     def _generate_single_abstract(
         self, payload: AbstractGenerateRequest
     ) -> AbstractItem:
-        """Generate one abstract and story_prompt pair."""
-        output_format = (
-            "\n\nOUTPUT FORMAT (STRICT): Return valid JSON only with these keys:\n"
-            '- "abstract": A short story abstract (2–4 sentences), plain text.\n'
-            '- "story_prompt": A prompt instructing how to turn the abstract into a full 5-minute '
-            "children's story (ages 8–12). Include tone, structure, and educational goals.\n"
-            "Example: {\"abstract\": \"...\", \"story_prompt\": \"...\"}"
+        prompt = f"""
+            # ROLE & OBJECTIVE
+            You are an elite narrative designer and award-winning children's author specializing in educational content. Your task is to act as the "Story Architect" for a YouTube channel targeting middle-grade readers. You will generate a high-concept Story Abstract based on a provided theme, heavily inspired by the energetic style of Korean "Why?" educational comics.
+
+            # THEME, TONE & TARGET AUDIENCE
+            - Theme / Core Question: **{payload.theme}**
+            - Target Audience: Children aged 8–12. They are naturally curious, love dramatic reactions, and quickly lose interest if a story feels like a textbook lecture.
+            - Tone & Vibe: Funny, playfully dramatic, fast-paced, and deeply curious. Capture the essence of Korean "Why?" comics—expect exaggerated reactions, funny misunderstandings, and explosive moments of scientific discovery.
+
+            # INSTRUCTIONS FOR THE STORY ABSTRACT
+            You must write a comprehensive story summary (150–200 words) that serves as the foundation for a 5-minute narrated video.
+            - The Hook: Begin with an exciting, highly dramatic, or goofy 1-2 sentence hook that sets up an immediate, absurd mystery.
+            - The Protagonist: Introduce a clear main character who is highly inquisitive, prone to exaggerated comic-style reactions, and constantly asking "WHY?!".
+            - The Setting: Establish a vivid, imaginative, or highly stylized world.
+            - The Conflict & Stakes: Clearly define a wildly dramatic (but kid-friendly) problem. What goes wrong, and what funny disaster happens if they fail?
+            - Educational Integration: The learning element MUST be the key to solving the conflict. The protagonist must discover the core science of the theme (**{payload.theme}**) through trial-and-error, hilarious misunderstandings, or dramatic "Aha!" revelations. It cannot be a tacked-on lecture.
+
+            Return ONLY the abstract text. Do not use JSON formatting or code blocks.
+            """
+        llm = ChatOpenAI(
+            model=DEFAULT_MODEL,
+            base_url=HF_ROUTER_BASE_URL,
+            api_key=self._get_hf_token(),
+            temperature=payload.temperature,
+            max_tokens=payload.max_tokens,
+            request_timeout=120,
         )
 
-        prompt = (
-            "You are a professional children's storyteller creating story abstracts.\n\n"
-            "Generate BOTH an abstract AND a story prompt based on this theme or question:\n"
-            f"**{payload.theme}**\n\n"
-            "INSTRUCTIONS FOR ABSTRACT:\n"
-            "- Base it entirely on the theme/'why?' above.\n"
-            "- Be creative and varied: introduce plausible characters, settings, or angles.\n"
-            "- Maintain high story quality: clear premise, age-appropriate language, educational potential.\n"
-            "- The abstract should be usable as source material for a full 5-minute children's story (ages 8–12).\n"
-            "- Include a hook that makes the reader want to hear the full story.\n\n"
-            "INSTRUCTIONS FOR STORY_PROMPT:\n"
-            "- Write a brief instruction (1–3 sentences) for transforming the abstract into the full story.\n"
-            "- Specify tone (e.g. playful, funny), target age, and how to weave in the educational content.\n"
-        ) + output_format
-
-        try:
-            llm = ChatOpenAI(
-                model=DEFAULT_MODEL,
-                base_url=HF_ROUTER_BASE_URL,
-                api_key=self._get_hf_token(),
-                temperature=payload.temperature,
-                max_tokens=payload.max_tokens,
-                request_timeout=120,
-            )
-            result = llm.invoke([HumanMessage(content=prompt)])
-            raw = self._extract_message_text(result.content)
-        except Exception as err:
-            raise HTTPException(status_code=502, detail=f"LLM request failed: {err}") from err
-
-        parsed = _extract_json_dict(raw)
         abstract_text = ""
-        story_prompt_text = ""
-
-        abstract_text = self._extract_abstract_text(raw, parsed)
-        if parsed:
-            story_prompt_text = str(parsed.get("story_prompt") or "").strip()
+        for attempt in range(3):
+            try:
+                messages = [
+                    SystemMessage(content="You are an elite narrative designer and award-winning children's author specializing in educational content."),
+                    HumanMessage(content=prompt)
+                ]
+                result = llm.invoke(messages)
+                abstract_text = self._extract_message_text(result.content).strip()
+                if abstract_text:
+                    break
+            except Exception as err:
+                if attempt == 2:
+                    raise HTTPException(status_code=502, detail=f"LLM request fail: {err}") from err
+                    
         if not abstract_text:
-            raise HTTPException(status_code=502, detail="Model returned empty content")
+            raise HTTPException(status_code=502, detail="Failed to generate abstract: Model returned empty content after 3 attempts.")
 
-        if not story_prompt_text:
-            story_prompt_text = self._generate_story_prompt_from_abstract(
-                abstract_text, payload.theme
-            )
+        story_prompt_text = self._generate_story_prompt_from_abstract(abstract_text, payload.theme)
 
         return AbstractItem(abstract=abstract_text, story_prompt=story_prompt_text)
 
